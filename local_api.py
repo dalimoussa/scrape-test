@@ -1,6 +1,7 @@
 import re
 import time
 import json
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import pytz
 
@@ -23,11 +24,18 @@ LIVE_SUFFIX = "_1_3"
 PREMATCH_DATA = {
     "_sports": {},
     "_by_oi": {},
+    "_by_date": {},
 }
 PREMATCH_SUFFIX = "_1_1"
 
 DATA = LIVE_DATA
 SUFFIX = LIVE_SUFFIX
+
+# =============================================================================
+# ROUTING & DIAGNOSTIC INSTRUMENTATION
+# =============================================================================
+ROUTING_STATS = defaultdict(int)
+UNCLASSIFIED_FRAMES = deque(maxlen=50)
 
 SPORT_NAMES = {
     "1": "Football",
@@ -73,6 +81,7 @@ def empty_prematch_store():
     return {
         "_sports": {},
         "_by_oi": {},
+        "_by_date": {},
     }
 
 
@@ -138,30 +147,30 @@ def parse_scores(score_str):
 
 
 def parse_bc_timestamp(bc_str):
-    """Parse Bet365 BC scheduled timestamp (YYYYMMDDHHMMSS) to ISO UTC and display string."""
+    """Parse Bet365 BC scheduled timestamp (YYYYMMDDHHMMSS) to ISO UTC, display string, and date key."""
     if not bc_str:
-        return None, "TBA"
+        return None, "TBA", None
     try:
         dt = datetime.strptime(str(bc_str).strip(), "%Y%m%d%H%M%S").replace(tzinfo=pytz.utc)
-        return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC")
+        return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC"), dt.strftime("%Y-%m-%d")
     except Exception:
-        return None, "TBA"
+        return None, "TBA", None
 
 
 def parse_scheduled_time(info):
     """Extract scheduled kickoff from BC, SM (Unix timestamp), or TU (UTC string)."""
     bc = info.get("BC")
     if bc:
-        iso_t, disp_t = parse_bc_timestamp(bc)
+        iso_t, disp_t, date_k = parse_bc_timestamp(bc)
         if iso_t:
-            return iso_t, disp_t
+            return iso_t, disp_t, date_k
 
     sm = info.get("SM")
     if sm:
         try:
             ts = int(sm)
             dt = datetime.fromtimestamp(ts, pytz.utc)
-            return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC")
+            return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC"), dt.strftime("%Y-%m-%d")
         except Exception:
             pass
 
@@ -169,11 +178,46 @@ def parse_scheduled_time(info):
     if tu:
         try:
             dt = datetime.strptime(str(tu).strip(), "%Y%m%d%H%M%S").replace(tzinfo=pytz.utc)
-            return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC")
+            return dt.isoformat().replace("+00:00", "Z"), dt.strftime("%d %b %H:%M UTC"), dt.strftime("%Y-%m-%d")
         except Exception:
             pass
 
-    return None, "TBA"
+    return None, "TBA", None
+
+
+def sweep_stale_prematch(max_age_hours=6):
+    """Remove pre-match fixtures whose kickoff has passed by max_age_hours or that transitioned to live."""
+    now = datetime.now(pytz.utc)
+    stale_keys = []
+    live_ois = set(LIVE_DATA.get("_by_oi", {}).keys())
+
+    for key, ev in list(PREMATCH_DATA.items()):
+        if not isinstance(ev, dict) or ev.get("status") != "prematch":
+            continue
+        fid = str(ev.get("fixtureId") or "")
+        if fid and fid in live_ois:
+            stale_keys.append(key)
+            continue
+        sched = ev.get("scheduledTime")
+        if sched:
+            try:
+                sched_dt = datetime.fromisoformat(sched.replace("Z", "+00:00"))
+                if (now - sched_dt) > timedelta(hours=max_age_hours):
+                    stale_keys.append(key)
+            except Exception:
+                pass
+
+    for key in stale_keys:
+        fid = PREMATCH_DATA.get(key, {}).get("fixtureId")
+        for cat in [k for k, v in PREMATCH_DATA.items() if isinstance(v, list) and k.startswith("C")]:
+            if key in PREMATCH_DATA[cat]:
+                PREMATCH_DATA[cat].remove(key)
+        for d_key, keys_in_date in list(PREMATCH_DATA.get("_by_date", {}).items()):
+            if key in keys_in_date:
+                keys_in_date.remove(key)
+        if fid and str(fid) in (PREMATCH_DATA.get("_by_oi") or {}):
+            del PREMATCH_DATA["_by_oi"][str(fid)]
+        PREMATCH_DATA.pop(key, None)
 
 
 def apply_language_id(language_id):
@@ -217,8 +261,9 @@ def apply_language_id(language_id):
     # Migrate pre-match store
     PREMATCH_DATA = empty_prematch_store()
     PREMATCH_DATA["_sports"] = old_prematch.get("_sports", {}) or {}
+    PREMATCH_DATA["_by_date"] = old_prematch.get("_by_date", {}) or {}
     for key, val in old_prematch.items():
-        if key in ("_sports", "_by_oi"):
+        if key in ("_sports", "_by_oi", "_by_date"):
             continue
         if isinstance(val, list) and key.startswith("C"):
             PREMATCH_DATA[key] = val
@@ -286,6 +331,15 @@ def handle_insert(it, data_obj, category_key, store=None):
         if markets and not store[it].get("markets"):
             store[it]["markets"] = markets
     ev = store[it]
+    ev["_last_updated"] = datetime.now(pytz.utc).isoformat()
+
+    # Index by date if prematch
+    sched_iso, sched_disp, date_k = parse_scheduled_time(ev)
+    if date_k and "_by_date" in store:
+        store["_by_date"].setdefault(date_k, [])
+        if it not in store["_by_date"][date_k]:
+            store["_by_date"][date_k].append(it)
+
     for fid in (data_obj.get("OI"), data_obj.get("C3"), ev.get("OI"), ev.get("C3"), data_obj.get("ID"), ev.get("ID"), data_obj.get("C2"), ev.get("C2")):
         if fid:
             store.setdefault("_by_oi", {})[str(fid)] = it
@@ -458,7 +512,7 @@ def attach_market(data_obj, store=None):
         return
     markets = ev.setdefault("markets", [])
     market = {
-        "id": data_obj.get("ID") or data_obj.get("MA") or "",
+        "id": data_obj.get("ID") or data_obj.get("MA") or str(len(markets) + 1),
         "ma": data_obj.get("MA") or data_obj.get("ID") or "",
         "name": market_name or "Full Time Result",
         "it": data_obj.get("IT") or "",
@@ -521,19 +575,17 @@ def is_ooc_frame(txt: str) -> bool:
 
 def parse_prematch_ooc(raw_txt: str) -> dict:
     """
-    Parse flat Odds On Coupon (OOC) / Upcoming frames.
-    - First collect event-summary PAs (have FI + EX)
-    - Then collect odds PAs (have OD + FI)
-    - Join by FI
-    - Use BC as scheduled time (YYYYMMDDHHMMSS -> ISO UTC)
-    - Use NA as competition / tournament
-    - Split EX into home/away
-    - Return dict keyed by fixture_id
+    Parse flat Odds On Coupon (OOC) / Upcoming frames with Multi-Market support.
+    - Groups selections by market first (_markets_raw), column second.
+    - Joins by FI
+    - Uses BC as scheduled time (YYYYMMDDHHMMSS -> ISO UTC)
+    - Returns dict keyed by fixture_id
     """
     events = {}
     current_sport_id = "1"
     current_col_name = ""
     current_league_name = ""
+    current_market_name = "Full Time Result"
 
     items = str(raw_txt).split('|')
     for item in items:
@@ -556,6 +608,8 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
         elif rtype == "MA":
             if dit.get("CL"):
                 current_sport_id = str(dit.get("CL"))
+            if dit.get("NA") and not dit.get("NA").startswith("/"):
+                current_market_name = dit.get("NA")
         elif rtype == "CO":
             current_col_name = dit.get("NA") or ""
         elif rtype == "PA":
@@ -570,11 +624,14 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                 teams = parse_teams(event_name)
                 if not teams["home"] or not teams["away"]:
                     continue
-                scheduled_iso, scheduled_disp = parse_bc_timestamp(dit.get("BC"))
+                scheduled_iso, scheduled_disp, date_key = parse_bc_timestamp(dit.get("BC"))
                 sport_name = SPORT_NAMES.get(str(current_sport_id), f"Sport {current_sport_id}")
                 league = dit.get("NA") or current_league_name or ""
                 if league.startswith("/") or "api/" in league.lower():
                     league = current_league_name or ""
+
+                default_m_name = "Match Winner" if str(current_sport_id) in ("13", "18", "16", "17") else "Full Time Result"
+                current_market_name = default_m_name
 
                 events[fi] = {
                     "fixtureId": fi,
@@ -587,9 +644,11 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                     "awayTeam": teams["away"],
                     "scheduledTime": scheduled_iso,
                     "scheduledDisplay": scheduled_disp,
+                    "_date_key": date_key,
                     "status": "prematch",
                     "score": {"home": None, "away": None, "display": ""},
-                    "_odds_by_col": {},
+                    "_markets_raw": {},
+                    "_last_updated": datetime.now(pytz.utc).isoformat(),
                     "markets": []
                 }
 
@@ -610,7 +669,8 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                     elif dit.get("NA") and not dit.get("NA").startswith("/"):
                         sel_name = dit.get("NA")
 
-                    events[fi]["_odds_by_col"][col] = {
+                    market_key = current_market_name or "Full Time Result"
+                    events[fi].setdefault("_markets_raw", {}).setdefault(market_key, {})[col] = {
                         "id": dit.get("ID") or "",
                         "name": sel_name,
                         "oddsDecimal": od_dec,
@@ -620,18 +680,18 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                         "order": dit.get("OR")
                     }
 
-    # Finalize markets array
+    # Finalize markets array (one entry per market_key)
     for fi, ev in events.items():
-        odds_dict = ev.pop("_odds_by_col", {})
-        odds_list = list(odds_dict.values())
-        market_name = "Match Winner" if ev["sportId"] in ("13", "18", "16", "17") else "Full Time Result"
-        if odds_list:
-            ev["markets"] = [{
-                "id": "1",
-                "name": market_name,
+        raw_markets = ev.pop("_markets_raw", {})
+        ev["markets"] = [
+            {
+                "id": str(i + 1),
+                "name": mname,
                 "suspended": False,
-                "odds": odds_list
-            }]
+                "odds": list(sels.values())
+            }
+            for i, (mname, sels) in enumerate(raw_markets.items())
+        ]
 
     return events
 
@@ -644,6 +704,7 @@ def update_data(target_key, txt, store=None, suffix=None):
     action_name, action_data = txt.split("|", 1)
 
     if action_name == "U":
+        ROUTING_STATS["delta_U"] += 1
         dit = to_dit(action_data)
         oi = ovsf_fixture_id(target_key)
         if oi and "_stats_by_oi" in store:
@@ -657,6 +718,7 @@ def update_data(target_key, txt, store=None, suffix=None):
             cur_idx = store[key].get("_current_market_idx")
             stats = store[key].get("stats")
             store[key].update(dit)
+            store[key]["_last_updated"] = datetime.now(pytz.utc).isoformat()
             if markets is not None and "markets" not in dit:
                 store[key]["markets"] = markets
             if cur_idx is not None and "_current_market_idx" not in dit:
@@ -668,6 +730,7 @@ def update_data(target_key, txt, store=None, suffix=None):
                 store.setdefault("_by_oi", {})[str(oi)] = key
 
     elif action_name == "I":
+        ROUTING_STATS["delta_I"] += 1
         if len(action_data) < 2:
             return
         data_type = action_data[:2]
@@ -691,6 +754,7 @@ def update_data(target_key, txt, store=None, suffix=None):
             attach_odds(dit, store)
 
     elif action_name == "D":
+        ROUTING_STATS["delta_D"] += 1
         it = str(target_key).split("/")[-1]
         sport_id, category_key = parse_ev_it(it, sfx)
         keys = []
@@ -782,17 +846,22 @@ def resolve_delta_store(action_key, action_val, msg_type):
 
     if key:
         if isinstance(PREMATCH_DATA.get(key), (dict, list)):
+            ROUTING_STATS["route_by_key_prematch"] += 1
             return PREMATCH_DATA, PREMATCH_SUFFIX
         if isinstance(LIVE_DATA.get(key), (dict, list)):
+            ROUTING_STATS["route_by_key_live"] += 1
             return LIVE_DATA, LIVE_SUFFIX
 
     if "SS=" in str(action_val) or "TM=" in str(action_val) or "TT=" in str(action_val):
+        ROUTING_STATS["route_by_live_tokens"] += 1
         return LIVE_DATA, LIVE_SUFFIX
 
     ak = str(action_key or "")
     if PREMATCH_SUFFIX and PREMATCH_SUFFIX in ak:
+        ROUTING_STATS["route_by_suffix_prematch"] += 1
         return PREMATCH_DATA, PREMATCH_SUFFIX
     if LIVE_SUFFIX and LIVE_SUFFIX in ak:
+        ROUTING_STATS["route_by_suffix_live"] += 1
         return LIVE_DATA, LIVE_SUFFIX
 
     oi = None
@@ -805,15 +874,20 @@ def resolve_delta_store(action_key, action_val, msg_type):
             oi = fi_m.group(1)
     if oi:
         if str(oi) in (PREMATCH_DATA.get("_by_oi") or {}):
+            ROUTING_STATS["route_by_oi_prematch"] += 1
             return PREMATCH_DATA, PREMATCH_SUFFIX
         if str(oi) in (LIVE_DATA.get("_by_oi") or {}):
+            ROUTING_STATS["route_by_oi_live"] += 1
             return LIVE_DATA, LIVE_SUFFIX
 
     if msg_type == "prematch":
+        ROUTING_STATS["route_by_msg_type_prematch"] += 1
         return PREMATCH_DATA, PREMATCH_SUFFIX
     if msg_type == "live":
+        ROUTING_STATS["route_by_msg_type_live"] += 1
         return LIVE_DATA, LIVE_SUFFIX
 
+    ROUTING_STATS["route_fallback_live"] += 1
     return LIVE_DATA, LIVE_SUFFIX
 
 
@@ -822,8 +896,19 @@ def data_parse(txt, msg_type='live'):
     if not txt:
         return
 
-    # Check for flat Odds On Coupon (OOC)
+    ROUTING_STATS[f"incoming_{msg_type}"] += 1
+
+    # Log unknown frames for /debug/unclassified
+    if msg_type == 'unknown':
+        UNCLASSIFIED_FRAMES.append({
+            "timestamp": datetime.now(pytz.utc).isoformat(),
+            "length": len(txt),
+            "preview": txt[:300]
+        })
+
+    # 1. Flat Odds On Coupon (OOC)
     if is_ooc_frame(txt):
+        ROUTING_STATS["snapshot_ooc"] += 1
         ooc_events = parse_prematch_ooc(txt)
         if ooc_events:
             for fi, ev_obj in ooc_events.items():
@@ -834,6 +919,14 @@ def data_parse(txt, msg_type='live'):
                 cat_list = PREMATCH_DATA.setdefault(cat_key, [])
                 if ev_key not in cat_list:
                     cat_list.append(ev_key)
+                
+                # Index by date
+                date_k = ev_obj.get("_date_key")
+                if date_k:
+                    PREMATCH_DATA.setdefault("_by_date", {}).setdefault(date_k, [])
+                    if ev_key not in PREMATCH_DATA["_by_date"][date_k]:
+                        PREMATCH_DATA["_by_date"][date_k].append(ev_key)
+
                 PREMATCH_DATA.setdefault("_by_oi", {})[str(fi)] = ev_key
                 sport_name = SPORT_NAMES.get(str(sport_id), f"Sport {sport_id}")
                 PREMATCH_DATA.setdefault("_sports", {})[str(sport_id)] = {
@@ -843,13 +936,15 @@ def data_parse(txt, msg_type='live'):
                 }
             return
 
-    # Snapshot frame starting with F| (e.g. #AO# Next to Start)
+    # 2. Snapshot frame starting with F| (e.g. #AO# Next to Start)
     if str(txt).startswith("F|"):
+        ROUTING_STATS["snapshot_F_prefix"] += 1
         target_store = LIVE_DATA if msg_type == 'live' else PREMATCH_DATA
         target_sfx = LIVE_SUFFIX if msg_type == 'live' else PREMATCH_SUFFIX
         init_data(txt, target_store, target_sfx)
         return
 
+    # 3. Multiplexed frames split by |\x08 or |
     item_arr = str(txt).split('|\x08')
     for item in item_arr:
         item = item.strip()
@@ -858,6 +953,7 @@ def data_parse(txt, msg_type='live'):
         action_item = item[1:].split('\x01', 1)
         if len(action_item) < 2:
             if item.startswith(('F|', '\x14')):
+                ROUTING_STATS["snapshot_raw"] += 1
                 target_store = LIVE_DATA if msg_type == 'live' else PREMATCH_DATA
                 target_sfx = LIVE_SUFFIX if msg_type == 'live' else PREMATCH_SUFFIX
                 init_data(item, target_store, target_sfx)
@@ -867,6 +963,7 @@ def data_parse(txt, msg_type='live'):
 
         # LIVE IN-PLAY SNAPSHOT
         if item.startswith('\x14OVInPlay_') or (msg_type == 'live' and item.startswith('\x14') and 'SS=' in action_val and 'TM=' in action_val):
+            ROUTING_STATS["snapshot_OVInPlay"] += 1
             preserved_stats = LIVE_DATA.get("_stats_by_oi") or {}
             LIVE_DATA.clear()
             LIVE_DATA.update(empty_live_store())
@@ -878,6 +975,7 @@ def data_parse(txt, msg_type='live'):
             
         # LIVE SOCCER TECH STATS
         elif item.startswith('\x14OVS1') or action_key.startswith('OVS1'):
+            ROUTING_STATS["snapshot_OVS1"] += 1
             DATA = LIVE_DATA
             SUFFIX = LIVE_SUFFIX
             if item.startswith('\x14') or str(action_val).startswith('F|') or str(action_val).startswith('|'):
@@ -887,6 +985,7 @@ def data_parse(txt, msg_type='live'):
 
         # OOC SNAPSHOT INSIDE ITEM
         elif item.startswith('\x14') and is_ooc_frame(action_val):
+            ROUTING_STATS["snapshot_ooc_nested"] += 1
             ooc_events = parse_prematch_ooc(action_val)
             for fi, ev_obj in ooc_events.items():
                 ev_key = f"FI_{fi}"
@@ -896,6 +995,13 @@ def data_parse(txt, msg_type='live'):
                 cat_list = PREMATCH_DATA.setdefault(cat_key, [])
                 if ev_key not in cat_list:
                     cat_list.append(ev_key)
+                
+                date_k = ev_obj.get("_date_key")
+                if date_k:
+                    PREMATCH_DATA.setdefault("_by_date", {}).setdefault(date_k, [])
+                    if ev_key not in PREMATCH_DATA["_by_date"][date_k]:
+                        PREMATCH_DATA["_by_date"][date_k].append(ev_key)
+
                 PREMATCH_DATA.setdefault("_by_oi", {})[str(fi)] = ev_key
                 sport_name = SPORT_NAMES.get(str(sport_id), f"Sport {sport_id}")
                 PREMATCH_DATA.setdefault("_sports", {})[str(sport_id)] = {
@@ -906,6 +1012,7 @@ def data_parse(txt, msg_type='live'):
 
         # OTHER SNAPSHOTS (Classic deep parser)
         elif item.startswith('\x14'):
+            ROUTING_STATS["snapshot_x14_generic"] += 1
             if msg_type == 'live' and ('SS=' in action_val or 'OVInPlay' in item):
                 init_data(action_val, LIVE_DATA, LIVE_SUFFIX)
             else:
@@ -1159,7 +1266,7 @@ def format_prematch_event(ev_it, info, sport_id):
     sport_meta = sports.get(str(sport_id), {})
     sport_name = sport_meta.get("name") or info.get("CL") or SPORT_NAMES.get(str(sport_id)) or f"Sport {sport_id}"
 
-    scheduled_ts, scheduled_display = parse_scheduled_time(info)
+    scheduled_ts, scheduled_display, date_k = parse_scheduled_time(info)
 
     markets = []
     for m in (info.get("markets") or []):
@@ -1181,7 +1288,7 @@ def format_prematch_event(ev_it, info, sport_id):
             })
         default_m_name = "Match Winner" if str(sport_id) in ("13", "18", "16", "17") else "Full Time Result"
         markets.append({
-            "id": m.get("id") or "1",
+            "id": m.get("id") or str(len(markets) + 1),
             "name": m_name or default_m_name,
             "suspended": m.get("su") == "1" or m.get("suspended") is True,
             "odds": odds_list,
@@ -1213,7 +1320,7 @@ def format_prematch_event(ev_it, info, sport_id):
     }
 
 
-def prematch_events_for_sport(sport_id):
+def prematch_events_for_sport(sport_id, target_date=None):
     # Collect IDs of matches currently live to purge them from pre-match
     live_ois = set(LIVE_DATA.get("_by_oi", {}).keys())
     live_teams = set()
@@ -1235,6 +1342,12 @@ def prematch_events_for_sport(sport_id):
             if not fmt:
                 continue
             
+            # Date filter if requested
+            if target_date:
+                sched = fmt.get("scheduledTime") or ""
+                if not sched.startswith(str(target_date)):
+                    continue
+
             # Exclude matches that have already started and moved to live
             fid = fmt.get("fixtureId")
             if fid and fid in live_ois:
@@ -1253,6 +1366,11 @@ def prematch_events_for_sport(sport_id):
             fmt = format_prematch_event(ev_it, info, sport_id)
             if not fmt:
                 continue
+
+            if target_date:
+                sched = fmt.get("scheduledTime") or ""
+                if not sched.startswith(str(target_date)):
+                    continue
 
             fid = fmt.get("fixtureId")
             if fid and fid in live_ois:
@@ -1348,6 +1466,9 @@ def sports_list():
     store = PREMATCH_DATA if scope == "prematch" else LIVE_DATA
     suffix = PREMATCH_SUFFIX if scope == "prematch" else LIVE_SUFFIX
 
+    if scope == "prematch":
+        sweep_stale_prematch()
+
     sports = store.get("_sports") or {}
     out = []
     ids = list_sport_ids(store)
@@ -1380,22 +1501,50 @@ def live_events_api():
 
 @app.route('/prematch', methods=['GET'])
 def prematch_events_api():
-    """All pre-match fixtures with teams, scheduled time, competition, and markets/odds."""
+    """All pre-match fixtures with teams, scheduled time, competition, and markets/odds. ?sport=1&date=YYYY-MM-DD"""
+    sweep_stale_prematch()
     sport = request.args.get("sport")
+    date_filter = request.args.get("date")
     competition = request.args.get("competition")
 
     if sport:
-        out = prematch_events_for_sport(str(sport))
+        out = prematch_events_for_sport(str(sport), target_date=date_filter)
     else:
         out = []
         for sid in list_sport_ids(PREMATCH_DATA):
-            out.extend(prematch_events_for_sport(sid))
+            out.extend(prematch_events_for_sport(sid, target_date=date_filter))
 
     if competition:
         comp_lower = competition.lower()
         out = [m for m in out if comp_lower in (m.get("league") or "").lower()]
 
     return pretty_json(out)
+
+
+@app.route('/prematch/<fixture_id>', methods=['GET'])
+def prematch_fixture_detail(fixture_id):
+    """Single pre-match fixture details by fixture ID."""
+    it, ev = find_ev_by_oi(fixture_id, PREMATCH_DATA)
+    if not ev:
+        return jsonify({"error": "Fixture not found"}), 404
+    sport_id = ev.get("sportId") or ev.get("_sportId", "1")
+    res = format_prematch_event(it, ev, sport_id)
+    if not res:
+        return jsonify({"error": "Fixture not found"}), 404
+    return pretty_json(res)
+
+
+@app.route('/prematch/<fixture_id>/markets', methods=['GET'])
+def prematch_fixture_markets(fixture_id):
+    """Markets and odds only for a given fixture ID."""
+    it, ev = find_ev_by_oi(fixture_id, PREMATCH_DATA)
+    if not ev:
+        return jsonify({"error": "Fixture not found"}), 404
+    sport_id = ev.get("sportId") or ev.get("_sportId", "1")
+    res = format_prematch_event(it, ev, sport_id)
+    if not res:
+        return jsonify({"error": "Fixture not found"}), 404
+    return pretty_json(res.get("markets") or [])
 
 
 @app.route('/fixtures', methods=['GET'])
@@ -1422,17 +1571,20 @@ def soccer_stats_api():
     return pretty_json(soccer_stats_list())
 
 
-@app.route('/prematch/<fixture_id>', methods=['GET'])
-def prematch_fixture_detail(fixture_id):
-    """Single pre-match fixture details by fixture ID."""
-    it, ev = find_ev_by_oi(fixture_id, PREMATCH_DATA)
-    if not ev:
-        return jsonify({"error": "Fixture not found"}), 404
-    sport_id = ev.get("sportId") or ev.get("_sportId", "1")
-    res = format_prematch_event(it, ev, sport_id)
-    if not res:
-        return jsonify({"error": "Fixture not found"}), 404
-    return pretty_json(res)
+# =============================================================================
+# DIAGNOSTIC & DEBUG ENDPOINTS
+# =============================================================================
+
+@app.route('/debug/routing', methods=['GET'])
+def debug_routing():
+    """Returns runtime routing hit counts for every classifier and parser branch."""
+    return pretty_json(dict(ROUTING_STATS))
+
+
+@app.route('/debug/unclassified', methods=['GET'])
+def debug_unclassified():
+    """Returns recent frames tagged as 'unknown' by the browser hook."""
+    return pretty_json(list(UNCLASSIFIED_FRAMES))
 
 
 # =============================================================================

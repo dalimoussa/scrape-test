@@ -1,27 +1,26 @@
 /**
- * Classify a raw WebSocket frame by inspecting topic patterns and current page URL.
- * \x14OVInPlay_… / \x14OVS1  → 'live'
- * #AO# (Next to Start), OVM, OVD, OVC, OOC, Coupons → 'prematch'
- * Page URL #/IP/ → 'live'
- * Page URL #/AO/ (Next to start / À venir), #/AC/ (coupons), #/AS/ (sports), #/HO/ (home) → 'prematch'
+ * Bet365 WebSocket Hook & Frame Classifier
  */
-function classifyFrame(data) {
-    if (typeof data !== 'string' || data.length < 2) return 'unknown';
 
-    // 1. Explicit Live Topics
-    if (data.indexOf('\x14OVInPlay') !== -1 || data.indexOf('\x14OVS1') !== -1) {
+const RAW_LOG = true; // Protocol reconnaissance logging
+
+function detectMsgType(payload) {
+    if (typeof payload !== 'string' || payload.length < 2) return 'unknown';
+
+    // 1. Confirmed Live Topics & In-Play Markers
+    if (payload.indexOf('\x14OVInPlay') !== -1 || payload.indexOf('\x14OVS1') !== -1) {
         return 'live';
     }
 
-    // 2. Explicit Pre-Match, Next to Start (#AO#) & Coupon Topics
-    if (data.indexOf('#AO#') !== -1 ||
-        data.indexOf('\x14OVM') !== -1 || 
-        data.indexOf('\x14OVD') !== -1 || 
-        data.indexOf('\x14OVC') !== -1 || 
-        data.indexOf('\x14OVPreMatch') !== -1 || 
-        data.indexOf('\x14OVUpcoming') !== -1 ||
-        data.indexOf('OOC-EV') !== -1 ||
-        data.indexOf('SY=oom') !== -1) {
+    // 2. Confirmed Pre-Match, Next to Start & Coupon Topics
+    if (payload.indexOf('#AO#') !== -1 ||
+        payload.indexOf('\x14OVM') !== -1 || 
+        payload.indexOf('\x14OVD') !== -1 || 
+        payload.indexOf('\x14OVC') !== -1 || 
+        payload.indexOf('\x14OVPreMatch') !== -1 || 
+        payload.indexOf('\x14OVUpcoming') !== -1 ||
+        payload.indexOf('OOC-EV') !== -1 ||
+        payload.indexOf('SY=oom') !== -1) {
         return 'prematch';
     }
 
@@ -42,36 +41,42 @@ function classifyFrame(data) {
         }
     } catch(e) {}
 
-    // 4. Live score and running timer markers in payload
-    if (data.indexOf('SS=') !== -1 && (data.indexOf('TM=') !== -1 || data.indexOf('TT=') !== -1)) {
+    // 4. Live Score and Running Clock Markers
+    if (payload.indexOf('SS=') !== -1 && (payload.indexOf('TM=') !== -1 || payload.indexOf('TT=') !== -1)) {
         return 'live';
     }
 
-    // 5. Delta category suffix patterns
-    if (data.charCodeAt(0) === 0x15) {
-        var m = data.match(/C\d+A_\d+_(\d)/);
+    // 5. Delta Category Suffix Patterns
+    if (payload.charCodeAt(0) === 0x15) {
+        var m = payload.match(/C\d+A_\d+_(\d)/);
         if (m) {
             return m[1] === '1' ? 'prematch' : 'live';
         }
     }
 
-    // Default to pre-match if not on in-play
-    return 'prematch';
+    console.warn('[Bet365 Hook] Unclassified frame, first 200 chars:', payload.slice(0, 200));
+    return 'unknown';
 }
 
 
 function wrap(obj, meth) {
    var orig = obj[meth];
    obj[meth] = function wrapper() {
+       var rawPayload = arguments[0];
        var lang = null;
        try {
            if (window.GamingContext && window.GamingContext.languageId != null) {
                lang = window.GamingContext.languageId;
            }
        } catch (e) {}
-       var frameType = classifyFrame(arguments[0]);
+
+       if (RAW_LOG && typeof rawPayload === 'string') {
+           console.log('[RAW]', rawPayload.length, rawPayload.slice(0, 300));
+       }
+
+       var frameType = detectMsgType(rawPayload);
        window.dispatchEvent(new CustomEvent('sendToAPI', {
-           detail: { data: arguments[0], lang: lang, type: frameType }
+           detail: { data: rawPayload, lang: lang, type: frameType }
        }));
        return orig.apply(this, arguments);
    }
