@@ -85,10 +85,10 @@ def pretty_json(data):
 
 
 def frac_to_dec(od_str):
-    """Convert fractional odds like '5/2' to decimal 3.50."""
+    """Convert fractional odds like '5/2' or decimal '1.62' / '1,62' to float 3.50."""
     if not od_str:
         return None
-    od_str = str(od_str).strip()
+    od_str = str(od_str).strip().replace(',', '.')
     if "/" in od_str:
         parts = od_str.split("/")
         try:
@@ -115,7 +115,7 @@ def parse_teams(event_name):
             parts = str(event_name).split(sep, 1)
             h = parts[0].strip()
             a = parts[1].strip()
-            if h and a:
+            if h and a and not h.startswith("/") and not a.startswith("/"):
                 return {"home": h, "away": a}
     return {"home": "", "away": ""}
 
@@ -483,13 +483,23 @@ def attach_odds(data_obj, store=None):
     idx = ev.get("_current_market_idx")
     if idx is None or idx < 0 or idx >= len(markets):
         idx = len(markets) - 1
+    
+    odds_val = data_obj.get("OD") or data_obj.get("DD") or ""
+    sel_name = data_obj.get("NA") or ""
+    if sel_name.startswith("/") or "api/" in sel_name.lower():
+        sel_name = ""
+
     markets[idx].setdefault("odds", []).append({
         "id": data_obj.get("ID") or "",
-        "od": data_obj.get("OD") or "",
+        "od": odds_val,
+        "oddsFractional": odds_val,
+        "oddsDecimal": frac_to_dec(odds_val),
         "or": data_obj.get("OR"),
         "ha": data_obj.get("HA") or data_obj.get("HD") or "",
-        "na": data_obj.get("NA") or "",
+        "na": sel_name,
+        "name": sel_name,
         "su": data_obj.get("SU"),
+        "suspended": data_obj.get("SU") == "1",
         "it": data_obj.get("IT") or "",
     })
 
@@ -502,7 +512,7 @@ def is_ooc_frame(txt: str) -> bool:
     """Detect if a WebSocket frame uses the flat Odds On Coupon (OOC) structure."""
     if not txt or not isinstance(txt, str):
         return False
-    if "SY=oom" in txt or "OOC-EV" in txt or "Odds On Coupon" in txt or "EX=Odds On" in txt:
+    if "SY=oom" in txt or "OOC-EV" in txt or "EX=Odds On Coupon" in txt:
         return True
     if ";EX=" in txt and ";BC=" in txt and ";FI=" in txt:
         return True
@@ -523,6 +533,7 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
     events = {}
     current_sport_id = "1"
     current_col_name = ""
+    current_league_name = ""
 
     items = str(raw_txt).split('|')
     for item in items:
@@ -538,6 +549,10 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                 current_sport_id = str(dit.get("ID"))
             elif dit.get("CL"):
                 current_sport_id = str(dit.get("CL"))
+        elif rtype in ("CT", "CD"):
+            name = dit.get("NA") or ""
+            if name and not name.startswith("/") and "api/" not in name.lower():
+                current_league_name = name
         elif rtype == "MA":
             if dit.get("CL"):
                 current_sport_id = str(dit.get("CL"))
@@ -549,7 +564,7 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                 continue
             fi = str(fi)
 
-            # Event-summary PA (contains EX, NA, BC, FI)
+            # 1. Event-summary PA (contains EX, NA, BC, FI)
             if dit.get("EX"):
                 event_name = dit.get("EX")
                 teams = parse_teams(event_name)
@@ -557,13 +572,16 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                     continue
                 scheduled_iso, scheduled_disp = parse_bc_timestamp(dit.get("BC"))
                 sport_name = SPORT_NAMES.get(str(current_sport_id), f"Sport {current_sport_id}")
-                
+                league = dit.get("NA") or current_league_name or ""
+                if league.startswith("/") or "api/" in league.lower():
+                    league = current_league_name or ""
+
                 events[fi] = {
                     "fixtureId": fi,
                     "id": str(dit.get("ID") or fi),
                     "sportId": str(current_sport_id),
                     "sport": sport_name,
-                    "league": dit.get("NA") or "",
+                    "league": league,
                     "event": event_name,
                     "homeTeam": teams["home"],
                     "awayTeam": teams["away"],
@@ -575,14 +593,13 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                     "markets": []
                 }
 
-            # Odds PA (contains OD, FI, OR, SU)
+            # 2. Odds PA (contains OD, FI, OR, SU)
             elif dit.get("OD"):
                 if fi in events:
                     col = current_col_name or dit.get("NA") or dit.get("OR") or "1"
                     od_frac = dit.get("OD")
                     od_dec = frac_to_dec(od_frac)
 
-                    # Map column label to meaningful team/selection name
                     sel_name = col
                     if col == "1":
                         sel_name = events[fi]["homeTeam"]
@@ -603,7 +620,7 @@ def parse_prematch_ooc(raw_txt: str) -> dict:
                         "order": dit.get("OR")
                     }
 
-    # Finalize markets list
+    # Finalize markets array
     for fi, ev in events.items():
         odds_dict = ev.pop("_odds_by_col", {})
         odds_list = list(odds_dict.values())
@@ -697,19 +714,30 @@ def update_data(target_key, txt, store=None, suffix=None):
 def init_data(txt, store=None, suffix=None):
     store = store if store is not None else DATA
     sfx = suffix if suffix is not None else SUFFIX
-    lst = str(txt).split("|")[1:]
+    lst = str(txt).split("|")
+    if len(lst) > 1 and lst[0] in ("F", ""):
+        lst = lst[1:]
     current_ev_it = None
+    current_ev_fi = None
     current_sport_id = "1"
+    current_league_name = ""
 
     for item in lst:
+        item = item.strip()
         if not item or len(item) < 2:
             continue
         data_type = item[:2]
-        data_obj = to_dit(item[3:] if len(item) > 3 else "")
+        data_obj = to_dit(item[3:] if len(item) > 3 and item[2] == ';' else item[2:])
 
         if data_type == "CL":
             register_sport_from_cl(data_obj, store)
             current_sport_id = data_obj.get("ID") or data_obj.get("CL") or current_sport_id
+            continue
+
+        if data_type in ("CT", "CD"):
+            name = data_obj.get("NA") or ""
+            if name and not name.startswith("/") and "api/" not in name.lower():
+                current_league_name = name
             continue
 
         it = data_obj.get("IT") or data_obj.get("OI") or data_obj.get("ID")
@@ -727,24 +755,24 @@ def init_data(txt, store=None, suffix=None):
                 it = f"EV_{data_obj.get('OI') or len(store)}"
                 
             data_obj["_sportId"] = str(sport_id)
+            if not data_obj.get("CT") and current_league_name:
+                data_obj["CT"] = current_league_name
+            
             handle_insert(it, data_obj, category_key, store)
             current_ev_it = it
+            current_ev_fi = data_obj.get("OI") or data_obj.get("ID") or it
             continue
 
         if data_type == "MA":
-            if data_obj.get("FI"):
-                attach_market(data_obj, store)
-            elif current_ev_it and isinstance(store.get(current_ev_it), dict):
-                data_obj["FI"] = store[current_ev_it].get("OI") or store[current_ev_it].get("fixtureId") or current_ev_it
-                attach_market(data_obj, store)
+            if not data_obj.get("FI") and current_ev_fi:
+                data_obj["FI"] = current_ev_fi
+            attach_market(data_obj, store)
             continue
 
         if data_type == "PA":
-            if data_obj.get("FI"):
-                attach_odds(data_obj, store)
-            elif current_ev_it and isinstance(store.get(current_ev_it), dict):
-                data_obj["FI"] = store[current_ev_it].get("OI") or store[current_ev_it].get("fixtureId") or current_ev_it
-                attach_odds(data_obj, store)
+            if not data_obj.get("FI") and current_ev_fi:
+                data_obj["FI"] = current_ev_fi
+            attach_odds(data_obj, store)
             continue
 
 
@@ -791,10 +819,10 @@ def resolve_delta_store(action_key, action_val, msg_type):
 
 def data_parse(txt, msg_type='live'):
     global DATA, SUFFIX
-    if not txt or not txt.startswith(('\x15', '\x14', 'F|')):
+    if not txt:
         return
 
-    # Check for flat Odds On Coupon (OOC) / Upcoming frame
+    # Check for flat Odds On Coupon (OOC)
     if is_ooc_frame(txt):
         ooc_events = parse_prematch_ooc(txt)
         if ooc_events:
@@ -815,13 +843,24 @@ def data_parse(txt, msg_type='live'):
                 }
             return
 
-    item_arr = txt.split('|\x08')
+    # Snapshot frame starting with F| (e.g. #AO# Next to Start)
+    if str(txt).startswith("F|"):
+        target_store = LIVE_DATA if msg_type == 'live' else PREMATCH_DATA
+        target_sfx = LIVE_SUFFIX if msg_type == 'live' else PREMATCH_SUFFIX
+        init_data(txt, target_store, target_sfx)
+        return
+
+    item_arr = str(txt).split('|\x08')
     for item in item_arr:
         item = item.strip()
         if not item:
             continue
         action_item = item[1:].split('\x01', 1)
         if len(action_item) < 2:
+            if item.startswith(('F|', '\x14')):
+                target_store = LIVE_DATA if msg_type == 'live' else PREMATCH_DATA
+                target_sfx = LIVE_SUFFIX if msg_type == 'live' else PREMATCH_SUFFIX
+                init_data(item, target_store, target_sfx)
             continue
         action_key = action_item[0]
         action_val = action_item[1]
@@ -1106,7 +1145,6 @@ def live_events_for_sport(sport_id):
 
 def format_prematch_event(ev_it, info, sport_id):
     """Structured pre-match event representation."""
-    # If already formatted by parse_prematch_ooc, return cleanly
     if info.get("status") == "prematch" and info.get("homeTeam") and info.get("awayTeam"):
         sport_name = SPORT_NAMES.get(str(sport_id), info.get("sport") or f"Sport {sport_id}")
         info["sport"] = sport_name
@@ -1154,12 +1192,16 @@ def format_prematch_event(ev_it, info, sport_id):
     if m_num and not fid:
         fid = m_num.group(1)
 
+    league = info.get("CT") or info.get("league") or ""
+    if league.startswith("/") or "api/" in league.lower():
+        league = ""
+
     return {
         "id": info.get("C2") or info.get("ID") or str(ev_it),
         "fixtureId": str(fid),
         "sportId": str(sport_id),
         "sport": sport_name,
-        "league": info.get("CT") or info.get("CB") or info.get("league") or "",
+        "league": league,
         "event": info.get("NA") or info.get("event") or f"{teams['home']} v {teams['away']}",
         "homeTeam": teams["home"],
         "awayTeam": teams["away"],
@@ -1172,6 +1214,15 @@ def format_prematch_event(ev_it, info, sport_id):
 
 
 def prematch_events_for_sport(sport_id):
+    # Collect IDs of matches currently live to purge them from pre-match
+    live_ois = set(LIVE_DATA.get("_by_oi", {}).keys())
+    live_teams = set()
+    for ev_it, ev in LIVE_DATA.items():
+        if isinstance(ev, dict) and ev.get("NA"):
+            t = parse_teams(ev["NA"])
+            if t["home"] and t["away"]:
+                live_teams.add((t["home"].lower(), t["away"].lower()))
+
     seen = set()
     out = []
     keys = [k for k, v in PREMATCH_DATA.items() if isinstance(v, list) and (k == f"C{sport_id}" or k.startswith(f"C{sport_id}A") or k.startswith(f"C{sport_id}_"))]
@@ -1183,10 +1234,18 @@ def prematch_events_for_sport(sport_id):
             fmt = format_prematch_event(ev_it, info, sport_id)
             if not fmt:
                 continue
-            dedup_key = (fmt["homeTeam"], fmt["awayTeam"])
-            if dedup_key in seen:
+            
+            # Exclude matches that have already started and moved to live
+            fid = fmt.get("fixtureId")
+            if fid and fid in live_ois:
                 continue
-            seen.add(dedup_key)
+            team_pair = (fmt["homeTeam"].lower(), fmt["awayTeam"].lower())
+            if team_pair in live_teams:
+                continue
+
+            if team_pair in seen:
+                continue
+            seen.add(team_pair)
             out.append(fmt)
 
     for ev_it, info in PREMATCH_DATA.items():
@@ -1194,10 +1253,17 @@ def prematch_events_for_sport(sport_id):
             fmt = format_prematch_event(ev_it, info, sport_id)
             if not fmt:
                 continue
-            dedup_key = (fmt["homeTeam"], fmt["awayTeam"])
-            if dedup_key in seen:
+
+            fid = fmt.get("fixtureId")
+            if fid and fid in live_ois:
                 continue
-            seen.add(dedup_key)
+            team_pair = (fmt["homeTeam"].lower(), fmt["awayTeam"].lower())
+            if team_pair in live_teams:
+                continue
+
+            if team_pair in seen:
+                continue
+            seen.add(team_pair)
             out.append(fmt)
 
     return out
@@ -1261,7 +1327,7 @@ def handle_data():
         data = request.json or {}
         try:
             apply_language_id(data.get("lang"))
-            msg_type = data.get("msgType", "prematch")
+            msg_type = data.get("type") or data.get("msgType") or "prematch"
             data_parse(data.get("data", ""), msg_type)
         except Exception as e:
             print(f"Error parsing data: {e}")
@@ -1887,7 +1953,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (filtered.length === 0) {
         grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;">
           <h3>No ${currentMode} matches found</h3>
-          <p>Make sure you open the Bet365 ${currentMode === 'prematch' ? 'Sports / Competitions (e.g. Football / Tennis / Basketball)' : 'In-Play'} page in Chrome with the extension active.</p>
+          <p>Make sure you open the Bet365 ${currentMode === 'prematch' ? 'Sports / Competitions / Next to Start (e.g. Football / Tennis / Basketball)' : 'In-Play'} page in Chrome with the extension active.</p>
         </div>`;
         return;
       }
