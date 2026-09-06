@@ -54,6 +54,8 @@ SPORT_NAMES = {
     "19": "Boxing / MMA",
     "36": "Australian Rules",
     "151": "Esports",
+    "151": "Esports",
+
 }
 
 SOCCER_STAT_FIELDS = {
