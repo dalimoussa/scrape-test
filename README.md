@@ -1,6 +1,6 @@
 # Bet365 Real-Time Scraper & API
 
-A real-time Bet365 scraper and Flask API that intercepts WebSocket traffic in Chrome to serve structured live scores, pre-match fixtures, and betting odds.
+A real-time Bet365 scraper, pre-match fixtures, and betting odds.
 
 ## 🚀 Quick Start
 
