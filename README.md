@@ -1,6 +1,6 @@
 # Bet365 Real-Time Scraper & API
 
-A real-time Bet365 scraper, pre-match fixtures, and betting odds bet365
+A real-time Bet365 scraper, pre-match fixtures, and betting odds for bet365
 
 ## 🚀 Quick Start
 
